@@ -16,5 +16,43 @@ def main():
     if not cap.isOpened():
         raise SystemExit("Cannot open video")
 
+    phase = 0
+    paused = False
+    mode, black, white = args.mode, args.black, args.white
+
+    print("[Keys] q=quit  space=pause/play  m=mode  a/z=black±1  s/x=white±1")
+
+    while True:
+        if not paused:
+            ok, frame = cap.read()
+            if not ok:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0); continue  # loop
+            if 0 < args.scale < 1.0:
+                h, w = frame.shape[:2]
+                frame = cv2.resize(frame, (int(w*args.scale), int(h*args.scale)), interpolation=cv2.INTER_AREA)
+            out = zebra_overlay(frame, mode, black, white, phase=phase)
+            phase = (phase + args.phase_step) % 10000
+        cv2.imshow("Zebra Preview", out)
+
+        k = cv2.waitKey(10) & 0xFF
+        if k == ord('q'):
+            break
+        elif k == ord(' '):
+            paused = not paused
+        elif k == ord('m'):
+            mode = {"Over":"Under","Under":"Both","Both":"Over"}[mode]
+            print("Mode:", mode)
+        elif k == ord('a'):
+            black = max(0, black-1); print("Black:", black)
+        elif k == ord('z'):
+            black = min(127, black+1); print("Black:", black)
+        elif k == ord('s'):
+            white = max(128, white-1); print("White:", white)
+        elif k == ord('x'):
+            white = min(255, white+1); print("White:", white)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
 if __name__ == "__main__":
     main()
