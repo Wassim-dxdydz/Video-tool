@@ -1,4 +1,5 @@
 import argparse, cv2
+from processing import zebra_overlay
 
 def parse_args():
     p = argparse.ArgumentParser(description="Live zebra preview (OpenCV window).")
