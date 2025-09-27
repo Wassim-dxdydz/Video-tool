@@ -1,4 +1,4 @@
-import argparse, cv2
+import argparse, cv2, numpy as np
 from processing import zebra_overlay
 
 def parse_args():
