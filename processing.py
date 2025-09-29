@@ -1,6 +1,13 @@
 import numpy as np
 import cv2
 
+_idx_cache = {}
+def _get_xy(h, w, period, duty):
+    key = (h, w, period, duty)
+    if key not in _idx_cache:
+        _idx_cache[key] = np.indices((h, w))
+    return _idx_cache[key]
+
 def to_luminance_b709(bgr: np.ndarray) -> np.ndarray:
     """
     Compute BT.709 luma from a BGR frame (uint8 -> float32), range ~0..255.
@@ -59,7 +66,7 @@ def zebra_overlay(frame_bgr: np.ndarray, mode: str, black: int, white: int,
     mask = over if under is None else (under if over is None else np.logical_or(over, under))  # (H,W) bool
 
     # Diagonal stripe pattern (animated)
-    yy, xx = np.indices((h, w))
+    yy, xx = _get_xy(h, w, period, duty)
     pattern = ((xx + yy + phase) % period) < duty  # (H,W) bool
 
     # 3-channel zebra image
