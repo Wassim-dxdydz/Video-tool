@@ -3,8 +3,9 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker
-from PyQt6.QtGui import QImage, QPixmap, QIcon
+from collections import deque
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QRect
+from PyQt6.QtGui import QImage, QPixmap, QIcon, QPainter, QColor, QPen
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog, QHBoxLayout,
     QVBoxLayout, QSlider, QComboBox, QGroupBox, QFormLayout, QMessageBox, QStatusBar, QSizePolicy
@@ -24,6 +25,7 @@ class VideoWorker(QThread):
     framePairReady = pyqtSignal(QImage, QImage)
     fpsInfo        = pyqtSignal(float)
     opened         = pyqtSignal(bool, str)
+    statsReady = pyqtSignal(int, float, float, float)
     
     def __init__(self):
         super().__init__()
@@ -35,6 +37,8 @@ class VideoWorker(QThread):
         self._mutex = QMutex()
         self._target_fps = 30.0
         self._path = None
+        self._seek_to = None
+        self._frame_idx = 0
 
     def open_video(self, path: str):
         if self._cap is not None:
@@ -49,6 +53,7 @@ class VideoWorker(QThread):
         self._target_fps = fps if 1.0 <= fps <= 240.0 else 30.0
         self._path = path
         self._phase = 0
+        self._frame_idx = 0
         self.opened.emit(True, f"Opened: {os.path.basename(path)} ({self._target_fps:.2f} fps)")
 
     def set_params(self, **kwargs):
@@ -66,15 +71,28 @@ class VideoWorker(QThread):
         last_ts = time.time()
         frames = 0
         fps_emit_last = time.time()
+
         while self._running:
             if self._cap is None or not self._cap.isOpened():
-                self.msleep(10); continue
+                self.msleep(10)
+                continue
             if self._pause:
-                self.msleep(10); continue
+                self.msleep(10)
+                continue
+
+            with QMutexLocker(self._mutex):
+                st = self._seek_to
+                self._seek_to = None
+            if st is not None:
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(st)))
+                self._frame_idx = max(0, int(st))
 
             ok, frame = self._cap.read()
             if not ok:
-                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0); continue
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self._frame_idx = 0
+                continue
+
             frame = safe_frame_bgr(frame)
 
             with QMutexLocker(self._mutex):
@@ -82,7 +100,14 @@ class VideoWorker(QThread):
 
             if 0.25 <= p.scale < 1.0:
                 h0, w0 = frame.shape[:2]
-                frame = cv2.resize(frame, (int(w0 * p.scale), int(h0 * p.scale)), interpolation=cv2.INTER_AREA)
+                frame = cv2.resize(frame, (int(w0 * p.scale), int(h0 * p.scale)),
+                                interpolation=cv2.INTER_AREA)
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            avgY = float(gray.mean())                      # 0..255
+            over_pct = float((gray >= p.white).mean())     # 0..1
+            under_pct = float((gray <= p.black).mean())    # 0..1
+            self.statsReady.emit(int(self._frame_idx), avgY, over_pct, under_pct)
 
             before_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             after_bgr  = zebra_overlay(frame, p.mode, p.black, p.white, phase=self._phase)
@@ -103,12 +128,121 @@ class VideoWorker(QThread):
             frames += 1
             if (time.time() - fps_emit_last) >= 0.5:
                 self.fpsInfo.emit(frames / (time.time() - fps_emit_last))
-                fps_emit_last = time.time(); frames = 0
+                fps_emit_last = time.time()
+                frames = 0
+
+            self._frame_idx += 1
 
         if self._cap is not None:
-            try: self._cap.release()
-            except: pass
+            try:
+                self._cap.release()
+            except:
+                pass
             self._cap = None
+
+    def seek_to(self, frame_idx: int):
+        with QMutexLocker(self._mutex):
+            self._seek_to = max(0, int(frame_idx))
+
+
+class TimelineWidget(QWidget):
+    seekRequested = pyqtSignal(int)  # frame index to jump to
+
+    def __init__(self, max_points=1200, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(160)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.max_points = max_points
+        self.frames   = deque(maxlen=max_points)  # absolute frame indices
+        self.avgY     = deque(maxlen=max_points)  # 0..255
+        self.overpct  = deque(maxlen=max_points)  # 0..1
+        self.underpct = deque(maxlen=max_points)  # 0..1
+        self._last_frame = -1
+
+    def on_stat(self, frame_idx: int, avgY: float, over: float, under: float):
+        self.frames.append(frame_idx)
+        self.avgY.append(avgY)
+        self.overpct.append(over)
+        self.underpct.append(under)
+        self._last_frame = frame_idx
+        self.update()
+
+    def paintEvent(self, ev):
+        if not self.frames:
+            return
+        p = QPainter(self)
+        rect = self.contentsRect()
+        p.fillRect(rect, QColor(22,22,22))
+
+        # axes
+        p.setPen(QPen(QColor(70,70,70), 1))
+        p.drawRect(rect.adjusted(0,0,-1,-1))
+
+        w = rect.width()
+        h = rect.height()
+        n = len(self.frames)
+        if n < 2:
+            return
+
+        # map helpers
+        def x_at(i):
+            return rect.left() + int((i/(n-1)) * (w-1))
+        def y_luma(v):   # 0..255 -> top..bottom
+            return rect.bottom() - int((v/255.0) * (h-20)) - 10
+        def y_pct(v):    # 0..1 -> top..bottom
+            return rect.bottom() - int(v * (h-20)) - 10
+
+        # grid lines
+        for yy in (0.25, 0.5, 0.75):
+            y = y_luma(yy*255)
+            p.setPen(QPen(QColor(55,55,55), 1, Qt.PenStyle.DotLine))
+            p.drawLine(rect.left(), y, rect.right(), y)
+
+        # draw average luma
+        p.setPen(QPen(QColor(200,200,200), 2))
+        prev = None
+        for i, v in enumerate(self.avgY):
+            pt = (x_at(i), y_luma(v))
+            if prev: p.drawLine(prev[0], prev[1], pt[0], pt[1])
+            prev = pt
+
+        # draw over/under percentages
+        p.setPen(QPen(QColor(200,60,60), 2))    # over – red
+        prev = None
+        for i, v in enumerate(self.overpct):
+            pt = (x_at(i), y_pct(v))
+            if prev: p.drawLine(prev[0], prev[1], pt[0], pt[1])
+            prev = pt
+
+        p.setPen(QPen(QColor(60,120,200), 2))   # under – blue
+        prev = None
+        for i, v in enumerate(self.underpct):
+            pt = (x_at(i), y_pct(v))
+            if prev: p.drawLine(prev[0], prev[1], pt[0], pt[1])
+            prev = pt
+
+        # playhead at last frame
+        p.setPen(QPen(QColor(180,180,0), 1))
+        x = x_at(n-1)
+        p.drawLine(x, rect.top(), x, rect.bottom())
+
+        # legend
+        p.setPen(QPen(QColor(180,180,180)))
+        p.drawText(rect.adjusted(6,4,-6,-6),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                   "Luma (gray) • Over% (red) • Under% (blue)")
+
+    def mousePressEvent(self, e):
+        if not self.frames:
+            return
+        rect = self.contentsRect()
+        n = len(self.frames)
+        t = (e.position().x() - rect.left()) / max(1, rect.width()-1)
+        t = min(1.0, max(0.0, t))
+        idx_in_window = int(t * (n-1))
+        target_frame = self.frames[0] + idx_in_window
+        self.seekRequested.emit(int(target_frame))
+
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -121,23 +255,25 @@ class MainWindow(QWidget):
             QGroupBox::title{subcontrol-origin: margin; left:8px; padding:0 4px;}
         """)
 
+        # --- Video views (Before / After) ---
         self.leftLabel  = QLabel("Before"); self.leftLabel.setObjectName("view")
         self.rightLabel = QLabel("After (Zebra)"); self.rightLabel.setObjectName("view")
         for lab in (self.leftLabel, self.rightLabel):
             lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lab.setScaledContents(False)
-            lab.setMinimumSize(1, 1)                                   # don't push window min-size
+            lab.setMinimumSize(1, 1)
             lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            lab.setFixedHeight(max(240, int(self.screen().availableGeometry().height() * 0.50)))  # 50% screen
+            lab.setFixedHeight(max(240, int(self.screen().availableGeometry().height() * 0.50)))  # ~50% of screen
 
         self._left_img  = None
         self._right_img = None
 
+        # --- Top row: Open | Play/Pause | Mode ---
         self.openBtn = QPushButton(" Open");  self.openBtn.setIcon(QIcon.fromTheme("document-open"))
         self.playBtn = QPushButton(" Play");  self.playBtn.setIcon(QIcon.fromTheme("media-playback-start"))
         self._is_playing = False
 
-        self.modeBox = QComboBox(); self.modeBox.addItems(["Both", "Over", "Under"])
+        self.modeBox = QComboBox(); self.modeBox.addItems(["Both", "Over", "Under"])  # exact item text
         same_h = max(self.openBtn.sizeHint().height() + 1, self.playBtn.sizeHint().height()+1)
         self.openBtn.setFixedHeight(same_h)
         self.playBtn.setFixedHeight(same_h)
@@ -150,13 +286,16 @@ class MainWindow(QWidget):
         topRow.addWidget(self.modeBox)
         topRow.addStretch(1)
 
+        # --- Center: side-by-side previews ---
         centerRow = QHBoxLayout()
         centerRow.addWidget(self.leftLabel, 1)
         centerRow.addWidget(self.rightLabel, 1)
 
-        self.blackVal   = QLabel("16")
-        self.whiteVal   = QLabel("235")
-        self.scaleVal   = QLabel("50%")
+        # --- Bottom: sliders (left) + timeline (right) ---
+        # values shown next to sliders (no spinboxes)
+        self.blackVal = QLabel("16")
+        self.whiteVal = QLabel("235")
+        self.scaleVal = QLabel("50%")
 
         self.blackSlider = QSlider(Qt.Orientation.Horizontal); self.blackSlider.setRange(0, 254); self.blackSlider.setValue(16)
         self.whiteSlider = QSlider(Qt.Orientation.Horizontal); self.whiteSlider.setRange(1, 255); self.whiteSlider.setValue(235)
@@ -173,38 +312,54 @@ class MainWindow(QWidget):
 
         bottomGB = QGroupBox("Thresholds & Scale")
         gbl = QVBoxLayout(bottomGB); gbl.addLayout(form)
-        
-        self.status = QStatusBar()
-        self._update_status(0.0)
 
+        # Right: live timeline
+        self.timeline = TimelineWidget(max_points=1200)
+        tlGroup = QGroupBox("Luma Timeline")
+        tlLayout = QVBoxLayout(tlGroup); tlLayout.setContentsMargins(8,8,8,8)
+        tlLayout.addWidget(self.timeline)
+
+        # Split bottom area (left sliders, right timeline)
         bottomSplit = QHBoxLayout()
         leftBottom = QWidget(); lbLayout = QVBoxLayout(leftBottom); lbLayout.setContentsMargins(0,0,0,0)
         lbLayout.addWidget(bottomGB)
-        rightBottom = QWidget()
+        rightBottom = QWidget(); rbLayout = QVBoxLayout(rightBottom); rbLayout.setContentsMargins(0,0,0,0)
+        rbLayout.addWidget(tlGroup)
         bottomSplit.addWidget(leftBottom, 1)
         bottomSplit.addWidget(rightBottom, 1)
+
+        # Status bar
+        self.status = QStatusBar()
+        self._update_status(0.0)
+
+        # Root layout
         root = QVBoxLayout(self)
         root.addLayout(topRow)
         root.addLayout(centerRow, 1)
         root.addLayout(bottomSplit)
         root.addWidget(self.status)
 
+        # --- Worker & connections ---
         self.worker = VideoWorker()
         self.worker.framePairReady.connect(self.on_frames)
         self.worker.fpsInfo.connect(self.on_fps)
         self.worker.opened.connect(self.on_opened)
+        # NEW: live stats -> timeline, and timeline click -> seek
+        self.worker.statsReady.connect(self.timeline.on_stat)
+        self.timeline.seekRequested.connect(self.worker.seek_to)
         self.worker.start()
 
+        # Controls
         self.openBtn.clicked.connect(self.choose_file)
         self.playBtn.clicked.connect(self.toggle_play_pause)
-        self.modeBox.currentTextChanged.connect(lambda m: (self.worker.set_params(mode=m), self._update_status()))
-
+        self.modeBox.currentTextChanged.connect(lambda m: (self.worker.set_params(mode=m.strip()), self._update_status()))
         self.blackSlider.valueChanged.connect(self._push_thresholds)
         self.whiteSlider.valueChanged.connect(self._push_thresholds)
         self.scaleSlider.valueChanged.connect(self._push_scale)
 
         self.showMaximized()
 
+    # ---------- helpers / slots ----------
     def _scaled_pixmap(self, qimg: QImage, target_label: QLabel) -> QPixmap:
         r = target_label.contentsRect()
         if qimg is None or r.width() <= 0 or r.height() <= 0:
@@ -276,10 +431,8 @@ class MainWindow(QWidget):
             else:
                 b = max(0, w - 1)
                 self.blackSlider.setValue(b)
-
         self.blackVal.setText(f"{b}")
         self.whiteVal.setText(f"{w}")
-
         self.worker.set_params(black=b, white=w)
         self._update_status()
 
@@ -289,7 +442,6 @@ class MainWindow(QWidget):
         scale = max(0.25, min(1.0, s / 100.0))
         self.worker.set_params(scale=scale)
         self._update_status()
-
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Space:
