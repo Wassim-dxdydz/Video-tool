@@ -554,6 +554,10 @@ class MainWindow(QWidget):
         # Status bar + export progress
         self.status = QStatusBar()
         self.exportBar = QProgressBar()
+        self.exportCancelBtn = QPushButton("Cancel")
+        self.exportCancelBtn.setVisible(False)
+        self.exportCancelBtn.clicked.connect(self._cancel_export)
+        self.status.addPermanentWidget(self.exportCancelBtn)
         self.exportBar.setFixedWidth(180)
         self.exportBar.setRange(0, 100)
         self.exportBar.setValue(0)
@@ -802,6 +806,7 @@ class MainWindow(QWidget):
         # show progress
         self.exportBar.setVisible(True)
         self.exportBar.setValue(0)
+        self.exportCancelBtn.setVisible(True)
 
         # start export worker
         self._exporter = ExportWorker(in_path, out_path, mode, black, white, phase_step=2)
@@ -817,6 +822,7 @@ class MainWindow(QWidget):
 
         # hide progress
         self.exportBar.setVisible(False)
+        self.exportCancelBtn.setVisible(False)
 
         # restore playback if it was playing
         if self._was_playing_before_export:
@@ -828,6 +834,10 @@ class MainWindow(QWidget):
         # cleanup
         self._exporter = None
         
+    def _cancel_export(self):
+        if getattr(self, "_exporter", None) and self._exporter.isRunning():
+            self._exporter.cancel()   
+    
     def _mark_a(self):
         fi = self.worker.current_frame()
         self._loop_a = fi
