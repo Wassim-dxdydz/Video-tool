@@ -25,6 +25,7 @@ class VideoWorker(QThread):
     framePairReady = pyqtSignal(QImage, QImage)
     fpsInfo        = pyqtSignal(float)
     opened         = pyqtSignal(bool, str)
+    posChanged     = pyqtSignal(int, int)
     statsReady = pyqtSignal(int, float, float, float)
     
     def __init__(self):
@@ -39,41 +40,17 @@ class VideoWorker(QThread):
         self._path = None
         self._seek_to = None
         self._frame_idx = 0
-
-    def open_video(self, path: str):
-        if self._cap is not None:
-            try:
-                self._cap.release()
-            except:
-                pass
-            self._cap = None
-
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            self.opened.emit(False, "Cannot open video.")
-            return
-        self._cap = cap
-
-        fps_raw = self._cap.get(cv2.CAP_PROP_FPS) or 0.0
-        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
-        count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        self._target_fps = fps_raw if 1.0 <= fps_raw <= 240.0 else 30.0
-
-        self._path = path
-        self._phase = 0
-        self._frame_idx = 0
-        self._frame_count = count
-        self._seek_to = None
-
+        self._pending_open = None
+        self._frame_count = 0
         self._loop_enabled = False
         self._loop_a = None
         self._loop_b = None
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        dur = (count / self._target_fps) if (self._target_fps > 0 and count > 0) else 0.0
-        name = os.path.basename(path)
-        self.opened.emit(True, f"Opened: {name}  {w}x{h}  {self._target_fps:.2f} fps  {count} frames (~{dur:.1f}s)")
 
+
+    def request_open(self, path: str):
+        """Called from GUI thread. Just store the path; run() will open it."""
+        with QMutexLocker(self._mutex):
+            self._pending_open = path
 
     def set_params(self, **kwargs):
         with QMutexLocker(self._mutex):
@@ -91,8 +68,56 @@ class VideoWorker(QThread):
         frames = 0
         fps_emit_last = time.time()
 
+        # tolerate missing attribute if you didn't add request_open yet
+        if not hasattr(self, "_pending_open"):
+            self._pending_open = None
+
         while self._running:
-            # wait for a valid, playing capture
+            # ---- handle pending open/close requests (from GUI) ----
+            with QMutexLocker(self._mutex):
+                path_req = self._pending_open
+                self._pending_open = None
+
+            if path_req is not None:
+                # release any existing capture on THIS thread
+                if self._cap is not None:
+                    try:
+                        self._cap.release()
+                    except:
+                        pass
+                    self._cap = None
+
+                cap = cv2.VideoCapture(path_req)
+                if not cap.isOpened():
+                    self.opened.emit(False, "Cannot open video.")
+                else:
+                    self._cap = cap
+                    fps_raw = self._cap.get(cv2.CAP_PROP_FPS) or 0.0
+                    w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+                    h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+                    count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+
+                    self._target_fps = fps_raw if 1.0 <= fps_raw <= 240.0 else 30.0
+                    self._path = path_req
+                    self._phase = 0
+                    self._frame_idx = 0
+                    self._frame_count = count
+                    self._seek_to = None  # clear any stale seek against old cap
+
+                    # (optional loop A/B defaults)
+                    self._loop_enabled = getattr(self, "_loop_enabled", False)
+                    self._loop_a = getattr(self, "_loop_a", None)
+                    self._loop_b = getattr(self, "_loop_b", None)
+
+                    # start at frame 0
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+                    dur = (count / self._target_fps) if (self._target_fps > 0 and count > 0) else 0.0
+                    name = os.path.basename(path_req)
+                    self.opened.emit(True, f"Opened: {name}  {w}x{h}  {self._target_fps:.2f} fps  {count} frames (~{dur:.1f}s)")
+                    self.posChanged.emit(0, int(self._frame_count))
+
+            # ---- wait for a valid, playing capture ----
             if self._cap is None or not self._cap.isOpened():
                 self.msleep(10)
                 continue
@@ -100,7 +125,7 @@ class VideoWorker(QThread):
                 self.msleep(10)
                 continue
 
-            # --- consume any pending seek (thread-safe) ---
+            # ---- consume any pending seek (thread-safe) ----
             with QMutexLocker(self._mutex):
                 st = self._seek_to
                 self._seek_to = None
@@ -112,15 +137,23 @@ class VideoWorker(QThread):
                     st = max(0, int(st))
                 self._cap.set(cv2.CAP_PROP_POS_FRAMES, st)
                 self._frame_idx = st
-                self._phase = 0  # keep zebra animation continuous after seeks
+                self.posChanged.emit(int(self._frame_idx), int(self._frame_count))
 
-            # --- read next frame (wrap to start at EOF) ---
+            # ---- read next frame (wrap/loop as needed) ----
             ok, frame = self._cap.read()
             if not ok:
-                # rewind if we know length; otherwise just try frame 0
-                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self._frame_idx = 0
-                continue
+                # if EOF, rewind (or loop range if enabled)
+                if getattr(self, "_frame_count", 0) > 0:
+                    if getattr(self, "_loop_enabled", False) and self._loop_a is not None:
+                        self._frame_idx = int(self._loop_a)
+                    else:
+                        self._frame_idx = 0
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_idx)
+                    continue
+                else:
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    self._frame_idx = 0
+                    continue
 
             frame = safe_frame_bgr(frame)
 
@@ -132,19 +165,18 @@ class VideoWorker(QThread):
             if 0.25 <= p.scale < 1.0:
                 h0, w0 = frame.shape[:2]
                 frame = cv2.resize(
-                    frame,
-                    (int(w0 * p.scale), int(h0 * p.scale)),
+                    frame, (int(w0 * p.scale), int(h0 * p.scale)),
                     interpolation=cv2.INTER_AREA
                 )
 
-            # --- live stats (avg luma, over/under %) ---
+            # ---- live stats (avg luma, over/under %) ----
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             avgY = float(gray.mean())                       # 0..255
             over_pct = float((gray >= p.white).mean())      # 0..1
             under_pct = float((gray <= p.black).mean())     # 0..1
             self.statsReady.emit(int(self._frame_idx), avgY, over_pct, under_pct)
 
-            # --- make QImages for UI ---
+            # ---- make QImages for UI ----
             before_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             after_bgr  = zebra_overlay(frame, p.mode, p.black, p.white, phase=self._phase)
             self._phase = (self._phase + p.phase_step) % 10000
@@ -154,27 +186,34 @@ class VideoWorker(QThread):
             q_before = QImage(before_rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
             q_after  = QImage(after_rgb.data,  w, h, 3 * w, QImage.Format.Format_RGB888).copy()
             self.framePairReady.emit(q_before, q_after)
+            self.posChanged.emit(int(self._frame_idx), int(self._frame_count))
 
-            # --- pacing to target FPS ---
+            # ---- pacing to target FPS ----
             frame_period = 1.0 / max(1.0, self._target_fps)
             dt = time.time() - last_ts
             if dt < frame_period:
                 self.msleep(int((frame_period - dt) * 1000))
             last_ts = time.time()
 
-            # --- FPS meter ---
+            # ---- FPS meter ----
             frames += 1
             if (time.time() - fps_emit_last) >= 0.5:
                 self.fpsInfo.emit(frames / (time.time() - fps_emit_last))
                 fps_emit_last = time.time()
                 frames = 0
 
-            # advance logical index
+            # advance logical index (+ optional loop range enforcement)
             self._frame_idx += 1
-            if getattr(self, "_frame_count", 0) > 0 and self._frame_idx >= self._frame_count:
-                self._frame_idx = 0  # keep it in range for stats/seek UI
+            if getattr(self, "_frame_count", 0) > 0:
+                if getattr(self, "_loop_enabled", False) and self._loop_a is not None and self._loop_b is not None:
+                    if self._frame_idx > int(self._loop_b):
+                        self._frame_idx = int(self._loop_a)
+                        self._cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_idx)
+                elif self._frame_idx >= self._frame_count:
+                    self._frame_idx = 0
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        # cleanup
+        # ---- cleanup ----
         if self._cap is not None:
             try:
                 self._cap.release()
@@ -195,9 +234,9 @@ class VideoWorker(QThread):
             self._frame_idx = frame_idx
             self._phase = 0
             
-    def seek_to_time(self, t_sec: float, *, pause: bool = False):
+    def seek_to_time(self, t_sec: float):
         fps = self._target_fps if self._target_fps > 0 else 30.0
-        self.seek_to(int(round(max(0.0, t_sec) * fps)), pause=pause)
+        self.seek_to(int(round(max(0.0, t_sec) * fps)))
 
     def total_frames(self) -> int:
         return int(self._frame_count)
@@ -422,12 +461,14 @@ class MainWindow(QWidget):
         self._loop_enabled = False
         self._loop_a = None
         self._loop_b = None
+        self._scrubbing = False          # NEW
+        self._was_playing = False        # NEW
+
+
 
         # --- Top row: Open | Play/Pause | Export… | Mode ---
         self.openBtn   = QPushButton(" Open");  self.openBtn.setIcon(QIcon.fromTheme("document-open"))
         self.playBtn   = QPushButton(" Play");  self.playBtn.setIcon(QIcon.fromTheme("media-playback-start"))
-        self.stepBackBtn = QPushButton(" -1f ")
-        self.stepFwdBtn  = QPushButton(" +1f ")
         self.setABtn     = QPushButton(" Set A ")
         self.setBBtn     = QPushButton(" Set B ")
         self.loopChk     = QCheckBox("Loop A-B")
@@ -438,7 +479,7 @@ class MainWindow(QWidget):
 
         # same heights
         same_h = max(self.openBtn.sizeHint().height() + 1, self.playBtn.sizeHint().height()+1)
-        for w in (self.openBtn, self.playBtn, self.exportBtn, self.modeBox, self.stepBackBtn, self.stepFwdBtn, self.setABtn, self.setBBtn, self.loopChk):
+        for w in (self.openBtn, self.playBtn, self.exportBtn, self.modeBox, self.setABtn, self.setBBtn, self.loopChk):
             w.setFixedHeight(same_h)
         self.modeBox.setMinimumWidth(80)
 
@@ -452,8 +493,6 @@ class MainWindow(QWidget):
         topRow = QHBoxLayout()
         topRow.addWidget(self.openBtn)
         topRow.addWidget(self.playBtn)
-        topRow.addWidget(self.stepBackBtn)
-        topRow.addWidget(self.stepFwdBtn)
         topRow.addWidget(self.setABtn)
         topRow.addWidget(self.setBBtn)
         topRow.addWidget(self.loopChk)
@@ -466,6 +505,16 @@ class MainWindow(QWidget):
         centerRow.addWidget(self.leftLabel, 1)
         centerRow.addWidget(self.rightLabel, 1)
 
+        
+        self.seekSlider = QSlider(Qt.Orientation.Horizontal)
+        self.seekSlider.setRange(0, 0)       # set after a video opens
+        self.seekSlider.setEnabled(False)    # enable on open
+        self.timeLabel  = QLabel("00:00 / 00:00")
+
+        seekRow = QHBoxLayout()
+        seekRow.addWidget(self.seekSlider, 1)
+        seekRow.addWidget(self.timeLabel)
+        
         # --- Bottom: sliders (left) + timeline (right) ---
         self.blackVal = QLabel("16")
         self.whiteVal = QLabel("235")
@@ -516,6 +565,7 @@ class MainWindow(QWidget):
         root = QVBoxLayout(self)
         root.addLayout(topRow)
         root.addLayout(centerRow, 1)
+        root.addLayout(seekRow) 
         root.addLayout(bottomSplit)
         root.addWidget(self.status)
 
@@ -526,11 +576,13 @@ class MainWindow(QWidget):
         self.worker.opened.connect(self.on_opened)
         self.worker.statsReady.connect(self.timeline.on_stat)
         self.timeline.seekRequested.connect(self.worker.seek_to)
-        self.stepBackBtn.clicked.connect(lambda: self.worker.step_frames(-1))
-        self.stepFwdBtn.clicked.connect(lambda: self.worker.step_frames(+1))
         self.setABtn.clicked.connect(self._mark_a)
         self.setBBtn.clicked.connect(self._mark_b)
         self.loopChk.toggled.connect(self._toggle_loop)
+        self.worker.posChanged.connect(self.on_pos_changed)
+        self.seekSlider.sliderPressed.connect(self._begin_scrub)
+        self.seekSlider.sliderReleased.connect(self._end_scrub)
+        self.seekSlider.sliderMoved.connect(self._scrub_to)
         self.worker.start()
 
         # Controls
@@ -592,13 +644,14 @@ class MainWindow(QWidget):
         if not ok:
             QMessageBox.warning(self, "Open video", msg)
         else:
+            self.seekSlider.setEnabled(True)
             self._set_playing(True)
 
     def choose_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.mov *.mkv *.avi);;All Files (*)")
         if not path:
             return
-        self.worker.open_video(path)
+        self.worker.request_open(path)
 
     def _set_playing(self, playing: bool):
         self._is_playing = playing
@@ -641,32 +694,66 @@ class MainWindow(QWidget):
         key = e.key()
         mods = e.modifiers()
 
+        # Play / pause
         if key == Qt.Key.Key_Space:
             self.toggle_play_pause(); e.accept(); return
 
-        # frame stepping
+        # --- seeking / stepping ---
         if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
             step = -1 if key == Qt.Key.Key_Left else +1
+            # Shift = 10 frames
             if mods & Qt.KeyboardModifier.ShiftModifier:
                 step *= 10
+            # Ctrl = ~1 second (converted to frames)
+            elif mods & Qt.KeyboardModifier.ControlModifier:
+                fps = getattr(self.worker, "_target_fps", 30.0) or 30.0
+                step *= max(1, int(round(fps)))
             self.worker.step_frames(step); e.accept(); return
 
-        # set A / B
+        # A/B marks
         if key == Qt.Key.Key_A:
             self._mark_a(); e.accept(); return
         if key == Qt.Key.Key_B:
             self._mark_b(); e.accept(); return
 
-        # toggle loop
+        # Toggle A–B loop
         if key == Qt.Key.Key_L:
             self.loopChk.toggle(); e.accept(); return
 
+        # --- quick threshold nudges ---
+        # [ / ]  -> black -/+ 1
+        if key == Qt.Key.Key_BracketLeft:
+            self.blackSlider.setValue(max(self.blackSlider.minimum(), self.blackSlider.value() - 1))
+            self._push_thresholds(); e.accept(); return
+        if key == Qt.Key.Key_BracketRight:
+            self.blackSlider.setValue(min(self.blackSlider.maximum(), self.blackSlider.value() + 1))
+            self._push_thresholds(); e.accept(); return
+        # - / =  -> white -/+ 1
+        if key == Qt.Key.Key_Minus:
+            self.whiteSlider.setValue(max(self.whiteSlider.minimum(), self.whiteSlider.value() - 1))
+            self._push_thresholds(); e.accept(); return
+        if key in (Qt.Key.Key_Equal, Qt.Key.Key_Plus):   # support = or Shift+=
+            self.whiteSlider.setValue(min(self.whiteSlider.maximum(), self.whiteSlider.value() + 1))
+            self._push_thresholds(); e.accept(); return
+
+        # Mode quick keys: 1=Both, 2=Over, 3=Under
+        if key == Qt.Key.Key_1:
+            self.modeBox.setCurrentText("Both"); e.accept(); return
+        if key == Qt.Key.Key_2:
+            self.modeBox.setCurrentText("Over"); e.accept(); return
+        if key == Qt.Key.Key_3:
+            self.modeBox.setCurrentText("Under"); e.accept(); return
+
+        # Full-screen toggle
+        if key == Qt.Key.Key_F:
+            self._toggle_fullscreen(); e.accept(); return
+
+        # Exit full-screen
         if key == Qt.Key.Key_Escape:
             if self.isFullScreen():
                 self.showNormal(); e.accept(); return
 
         super().keyPressEvent(e)
-
 
     def closeEvent(self, e):
         # cancel any running export cleanly
@@ -768,8 +855,61 @@ class MainWindow(QWidget):
             self.worker.seek_to(self._loop_a)
         self._update_status()
     
-        
+    def on_pos_changed(self, frame_idx: int, frame_count: int):
+        """Keep the slider/time in sync while playing. Ignore slider set while scrubbing."""
+        if not self._scrubbing:
+            # set range once (or when it changes)
+            max_val = max(0, frame_count - 1)
+            if self.seekSlider.maximum() != max_val:
+                self.seekSlider.setRange(0, max_val)
+            # update slider position
+            self.seekSlider.setValue(max(0, min(frame_idx, max_val)))
+        # update time label either way
+        self._update_time_label(frame_idx, frame_count)
 
+    def _begin_scrub(self):
+        """Pause while user drags the knob; remember play state."""
+        self._scrubbing = True
+        self._was_playing = self._is_playing
+        if self._is_playing:
+            self._set_playing(False)
+
+    def _scrub_to(self, value: int):
+        """While dragging, preview the target time in the label."""
+        frame_count = self.seekSlider.maximum() + 1
+        self._update_time_label(value, frame_count)
+
+    def _end_scrub(self):
+        """Seek to the chosen frame; optionally resume playback."""
+        value = self.seekSlider.value()
+        if hasattr(self.worker, "seek_to"):
+            self.worker.seek_to(int(value))
+        # show the previewed time accurately
+        self._update_time_label(value, self.seekSlider.maximum() + 1)
+        self._scrubbing = False
+        if self._was_playing:
+            self._set_playing(True)
+
+    def _update_time_label(self, idx: int, count: int):
+        fps = getattr(self.worker, "_target_fps", 30.0) or 30.0
+        cur_s = idx / fps if fps > 0 else 0.0
+        tot_s = count / fps if fps > 0 else 0.0
+        self.timeLabel.setText(f"{self._fmt_time(cur_s)} / {self._fmt_time(tot_s)}")
+
+    def _fmt_time(self, seconds: float) -> str:
+        s = int(round(seconds))
+        h = s // 3600
+        m = (s % 3600) // 60
+        s = s % 60
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+    
+    def _toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
 def main():
     app = QApplication(sys.argv)
