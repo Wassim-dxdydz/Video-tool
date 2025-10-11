@@ -6,12 +6,12 @@ The **Zebra Video Processing Tool** is a lightweight application designed to pro
 
 ## Features
 
- Upload and process video files  
-Zebra detection using computer vision  
-Frame-by-frame processing  
-Export processed videos  
-Export detection reports (CSV/JSON)  
-GUI
+- Upload and process video files  
+- Zebra detection using computer vision  
+- Frame-by-frame processing  
+- Export processed videos  
+- Export detection reports (CSV/JSON)  
+- GUI
 
 ---
 
